@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# Project generated data (Case 1)
+data/raw/
+data/output/
+*.xlsx
+*.json

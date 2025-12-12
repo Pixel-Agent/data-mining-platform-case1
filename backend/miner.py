@@ -49,6 +49,7 @@ def mine_case1_records(raw_records: List[Dict[str, Any]], gpt_client=None) -> Tu
             "Primary Category": primary_cat or raw_cat or "Other",
             "Address": addr,
             "Phone": phone,
+            "Email": (r.get("email") or "").strip(),
             "Website": website,
             "Has Website": "Yes" if _has_website(website) else "No",
             "Source": (r.get("source") or "").strip(),
