@@ -1,29 +1,48 @@
-# ui/app_case1.py
+from __future__ import annotations
+
 import os
 import sys
 import base64
-from datetime import datetime
 from typing import Optional, Dict, Any
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
+import streamlit.components.v1 as components  # noqa: F401
 
 # -----------------------------
-# Backend import (Case 1)
+# Project Root (FIX)
 # -----------------------------
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT_DIR not in sys.path:
-    sys.path.insert(0, ROOT_DIR)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 
-from backend.agent_logic_case1 import run_case1_pipeline
-
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # -----------------------------
-# Helpers
+# Backend Loading
+# -----------------------------
+try:
+    from backend.agent_logic_case1 import run_case1_pipeline
+except ImportError:
+    try:
+        from agent_logic_case1 import run_case1_pipeline  # type: ignore
+    except ImportError as e:
+        st.error(f"❌ Critical Error: Backend modules not found. {e}")
+        st.info(f"Make sure 'backend/agent_logic_case1.py' exists in {PROJECT_ROOT}")
+        st.stop()
+
+# -----------------------------
+# Config (for dynamic UI caps)
+# -----------------------------
+try:
+    from backend.config import TOP_N_CAP as UI_TOP_N_CAP
+except Exception:
+    UI_TOP_N_CAP = 300  # safe fallback
+
+# -----------------------------
+# UI Helpers & Formatting
 # -----------------------------
 def _b64_image(path: str) -> str:
-    """Return base64 for image; empty string if missing."""
     try:
         if not path or not os.path.exists(path):
             return ""
@@ -33,727 +52,248 @@ def _b64_image(path: str) -> str:
         return ""
 
 
-def _read_bytes(path: str) -> Optional[bytes]:
-    try:
-        if path and os.path.exists(path):
-            with open(path, "rb") as f:
-                return f.read()
-    except Exception:
-        return None
-    return None
+def _ensure_role_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Align leadership columns for consistent display.
+
+    Your FINAL schema is:
+      Name 1 / Designation 1 ... Name 5 / Designation 5
+    But older code sometimes had:
+      Leader 1 Role, Leader 1 Designation, etc.
+    So we normalize a few common variations into Name/Designation format.
+    """
+    if df is None or df.empty:
+        return df
+
+    rename_map = {}
+
+    # old -> new
+    for i in range(1, 6):
+        # if someone used Leader columns
+        if f"Leader {i} Name" in df.columns and f"Name {i}" not in df.columns:
+            rename_map[f"Leader {i} Name"] = f"Name {i}"
+        if f"Leader {i} Role" in df.columns and f"Designation {i}" not in df.columns:
+            rename_map[f"Leader {i} Role"] = f"Designation {i}"
+        if f"Leader {i} Designation" in df.columns and f"Designation {i}" not in df.columns:
+            rename_map[f"Leader {i} Designation"] = f"Designation {i}"
+
+    # apply once
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    return df
 
 
-def _safe_int(x: Any, default: int = 0) -> int:
-    try:
-        if x is None:
-            return default
-        s = str(x).strip()
-        if not s:
-            return default
-        return int(float(s))
-    except Exception:
-        return default
-
-
-# -----------------------------
-# Pixel11-style UI CSS
-# -----------------------------
 def _inject_css() -> None:
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@200;400;700;800&display=swap');
+
         :root{
-          --bg: #050507;
-          --panel: rgba(18, 12, 28, 0.55);
+          --bg: #030305;
+          --panel: rgba(18, 18, 26, 0.75);
           --stroke: rgba(255,255,255,0.08);
-
           --text: #f4f4f7;
-          --muted: rgba(244,244,247,0.72);
-
-          --purple: #7c3aed;
-          --purple2:#a855f7;
-
-          --radius: 22px;
-          --pad: clamp(1rem, 2.2vw, 1.55rem);
-
-          --fs-base: clamp(15px, 1.05vw, 17px);
-          --fs-small: clamp(13px, 0.90vw, 14.5px);
-          --fs-medium: clamp(16px, 1.20vw, 19px);
-          --fs-title: clamp(34px, 4.1vw, 56px);
+          --accent: #7c3aed;
+          --radius: 24px;
         }
 
-        html, body, [class*="css"], p, span, div, label, small, a, li {
-          font-family: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          font-size: var(--fs-base);
-          color: var(--text) !important;
+        .stApp {
+            background: radial-gradient(circle at 50% -20%, #1e1b4b 0%, #030305 80%);
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            color: var(--text);
         }
 
-        #MainMenu, footer, header { visibility: hidden; }
-
-        .block-container{
-          max-width: min(96vw, 1300px);
-          padding: clamp(0.9rem, 2.2vw, 2.2rem) !important;
-          padding-top: clamp(6.3rem, 7vw, 7.0rem) !important;
-          position: relative;
-          z-index: 3;
+        .card{
+          background: var(--panel); border: 1px solid var(--stroke);
+          border-radius: var(--radius); padding: 1.8rem;
+          backdrop-filter: blur(20px); margin-bottom: 1.5rem;
+          box-shadow: 0 10px 40px rgba(0,0,0,0.6);
         }
 
-        [data-testid="stAppViewContainer"]{
-          background:
-            radial-gradient(900px 520px at 52% 16%, rgba(124,58,237,0.52), rgba(0,0,0,0) 62%),
-            radial-gradient(760px 520px at 22% 90%, rgba(168,85,247,0.14), rgba(0,0,0,0) 60%),
-            radial-gradient(720px 520px at 86% 92%, rgba(124,58,237,0.10), rgba(0,0,0,0) 62%),
-            linear-gradient(180deg, #050507 0%, #050507 100%);
+        @keyframes pulse-ai {
+            0% { box-shadow: 0 0 0 0 rgba(124, 58, 237, 0.6); }
+            70% { box-shadow: 0 0 0 15px rgba(124, 58, 237, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(124, 58, 237, 0); }
+        }
+        .ai-active {
+            animation: pulse-ai 2s infinite;
+            border: 1px solid var(--accent) !important;
         }
 
-        [data-testid="stAppViewContainer"]::before{
-          content:"";
-          position: fixed;
-          inset: 0;
-          pointer-events: none;
-          background-image:
-            radial-gradient(circle, rgba(168,85,247,0.35) 1px, transparent 1.8px),
-            radial-gradient(circle, rgba(124,58,237,0.22) 1px, transparent 1.8px);
-          background-size: 120px 120px, 180px 180px;
-          background-position: 0 0, 40px 60px;
-          opacity: 0.35;
-          animation: drift 18s linear infinite;
-          z-index: 0;
-        }
-        @keyframes drift {
-          from { transform: translateY(0px); }
-          to   { transform: translateY(-80px); }
+        .px-title {
+            font-size: clamp(38px, 6vw, 72px);
+            font-weight: 900;
+            background: linear-gradient(90deg, #fff, #a78bfa, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-align: center;
+            letter-spacing: -2px;
         }
 
         .px-nav{
-          position: fixed;
-          top: 0; left: 0; right: 0;
-          z-index: 9999;
-          padding: 14px 22px;
-          background: rgba(5,5,7,0.55);
-          backdrop-filter: blur(14px);
-          border-bottom: 1px solid rgba(255,255,255,0.06);
-        }
-        .px-nav-inner{
-          max-width: min(96vw, 1300px);
-          margin: 0 auto;
-          display:flex;
-          align-items:center;
-          justify-content:center;
-        }
-        .px-brand{
-          display:flex;
-          align-items:center;
-          gap: 14px;
-        }
-        .px-brand img{
-          height: 66px;
-          width: auto;
-          display:block;
-          filter: drop-shadow(0 18px 44px rgba(124,58,237,0.26));
-        }
-        .px-brand-title{
-          font-size: 28px;
-          font-weight: 950;
-          letter-spacing: -0.03em;
-          color: rgba(244,244,247,0.95);
-          text-shadow: 0 18px 44px rgba(124,58,237,0.18);
+          position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+          padding: 12px 40px; background: rgba(3,3,5,0.85);
+          backdrop-filter: blur(18px); border-bottom: 1px solid var(--stroke);
         }
 
-        .bg-bubbles{
-          position: fixed;
-          inset: 0;
-          pointer-events: none;
-          z-index: 1;
-          overflow: hidden;
+        .logline {
+            display: flex; align-items: center; gap: 12px; padding: 12px;
+            background: rgba(255,255,255,0.04); border-radius: 14px; margin: 8px 0;
+            border: 1px solid rgba(255,255,255,0.05);
         }
-        .bg-bubble{
-          position: absolute;
-          width: 44px; height: 44px;
-          border-radius: 999px;
-          background: rgba(124,58,237,0.34);
-          border: 1px solid rgba(255,255,255,0.10);
-          box-shadow: 0 22px 80px rgba(124,58,237,0.22);
-          display:flex;
-          align-items:center;
-          justify-content:center;
-          color: rgba(255,255,255,0.86);
-          font-weight: 900;
-          opacity: 0.92;
-          animation: floaty 6.2s ease-in-out infinite;
-        }
-        .bg-bubble.big{
-          width: 56px; height: 56px;
-          background: rgba(168,85,247,0.26);
-        }
-        @keyframes floaty{
-          0%,100% { transform: translateY(0px); }
-          50%     { transform: translateY(-18px); }
-        }
-        .bb1{ top: 14%; left: 10%; animation-delay: .1s; }
-        .bb2{ top: 16%; left: 88%; animation-delay: .7s; }
-        .bb3{ top: 52%; left: 94%; animation-delay: 1.1s; }
-        .bb4{ top: 74%; left: 12%; animation-delay: 1.6s; }
-        .bb5{ top: 86%; left: 86%; animation-delay: 2.0s; }
-        .bb6{ top: 44%; left: 6%;  animation-delay: 2.4s; }
-        .bb7{ top: 90%; left: 52%; animation-delay: 2.9s; }
-        .bb8{ top: 28%; left: 72%; animation-delay: 3.2s; }
+        .dot { height: 10px; width: 10px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 10px var(--accent); }
 
-        .card{
-          background: var(--panel);
-          border: 1px solid var(--stroke);
-          border-radius: var(--radius);
-          padding: var(--pad);
-          backdrop-filter: blur(14px);
-          -webkit-backdrop-filter: blur(14px);
-          box-shadow: 0 22px 70px rgba(0,0,0,0.55);
-          position: relative;
-          z-index: 3;
-        }
-
-        .px-hero{
-          position: relative;
-          overflow: hidden;
-          padding: clamp(2.2rem, 5vw, 3.4rem) clamp(1.2rem, 3vw, 2.2rem);
-          text-align: center;
-          background: rgba(10, 7, 14, 0.35);
-          border: 1px solid rgba(255,255,255,0.06);
-          border-radius: var(--radius);
-          z-index: 3;
-        }
-        .px-hero::before{
-          content:"";
-          position:absolute;
-          inset:-40px;
-          background: radial-gradient(520px 300px at 50% 18%, rgba(124,58,237,0.50), transparent 65%);
-          opacity: 0.9;
-          pointer-events:none;
-        }
-        .px-title{
-          font-size: var(--fs-title);
-          font-weight: 950;
-          letter-spacing: -0.045em;
-          line-height: 1.05;
-          margin: .6rem 0 .45rem 0;
-          position: relative;
-          z-index: 2;
-        }
-        .px-subtitle{
-          font-size: var(--fs-medium);
-          font-weight: 720;
-          color: rgba(244,244,247,0.74) !important;
-          margin: 0;
-          position: relative;
-          z-index: 2;
-        }
-        .px-meta{
-          margin-top: .75rem;
-          font-size: var(--fs-small);
-          font-weight: 750;
-          color: rgba(244,244,247,0.70) !important;
-          position: relative;
-          z-index: 2;
-        }
-
-        .wave-wrap{
-          margin-top: 14px;
-          border-radius: 18px;
-          overflow: hidden;
-          opacity: .95;
-          filter: drop-shadow(0 18px 60px rgba(124,58,237,0.14));
-        }
-
-        .stTextInput label, .stNumberInput label{
-          font-size: var(--fs-medium) !important;
-          font-weight: 850 !important;
-          color: rgba(244,244,247,0.92) !important;
-        }
-        .stTextInput input, .stNumberInput input{
-          border-radius: 16px !important;
-          padding: clamp(0.78rem, 1.4vw, 1.02rem) !important;
-          font-size: var(--fs-medium) !important;
-          background: rgba(255,255,255,0.06) !important;
-          color: rgba(244,244,247,0.94) !important;
-          border: 1px solid rgba(255,255,255,0.10) !important;
-          box-shadow: 0 16px 45px rgba(0,0,0,0.45) !important;
-        }
-
-        div[data-testid="stButton"] > button,
-        div[data-testid="stDownloadButton"] > button{
-          border-radius: 999px;
-          padding: clamp(0.85rem, 1.5vw, 1.05rem) clamp(1.2rem, 2.0vw, 1.35rem);
-          font-size: var(--fs-medium);
-          font-weight: 950;
-          border: 1px solid rgba(255,255,255,0.10);
-          background: linear-gradient(135deg, rgba(124,58,237,0.95) 0%, rgba(168,85,247,0.65) 70%);
-          color:#fff !important;
-          box-shadow: 0 26px 90px rgba(124,58,237,0.30);
-          transition: transform .18s ease, box-shadow .18s ease, filter .18s ease;
-        }
-        div[data-testid="stButton"] > button:hover,
-        div[data-testid="stDownloadButton"] > button:hover{
-          transform: translateY(-2px);
-          filter: brightness(1.04);
-          box-shadow: 0 34px 120px rgba(124,58,237,0.40);
-        }
-
-        .logline{
-          display:flex;
-          align-items:center;
-          gap:.8rem;
-          padding:.78rem .95rem;
-          border-radius: 16px;
-          background: rgba(255,255,255,0.04);
-          border: 1px solid rgba(255,255,255,0.08);
-          margin: .5rem 0;
-          box-shadow: 0 16px 50px rgba(0,0,0,0.45);
-        }
-        .dot{
-          width: 11px;
-          height: 11px;
-          border-radius: 50%;
-          background: rgba(124,58,237,0.95);
-          box-shadow: 0 0 0 6px rgba(124,58,237,0.22);
-        }
-
-        [data-testid="stDataFrame"]{
-          border-radius: 18px;
-          overflow: hidden;
-          border: 1px solid rgba(255,255,255,0.10);
-          background: rgba(255,255,255,0.03);
-          box-shadow: 0 22px 70px rgba(0,0,0,0.55);
-        }
-
-        .anchor{ position: relative; top: -92px; }
-        .fade-in { animation: fadeIn 260ms ease-out; }
-        @keyframes fadeIn {
-          from { opacity: 0; transform: translateY(10px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-
-        @media (max-width: 900px){
-          .block-container{ max-width: 98vw; padding: 1rem !important; padding-top: 6.8rem !important; }
-          .px-brand img{ height: 56px; }
-          .px-brand-title{ font-size: 24px; }
-          .anchor{ top: -96px; }
-        }
+        #MainMenu, footer, header { visibility: hidden; }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _navbar() -> None:
-    base_dir = os.path.abspath(os.path.dirname(__file__))
-    logo_path = os.path.join(base_dir, "assets", "pixel11_logo.jpeg")
+def _navbar():
+    assets_dir = os.path.join(PROJECT_ROOT, "ui", "assets")
+    logo_path = os.path.join(assets_dir, "pixel11_logo.jpeg")
     logo_b64 = _b64_image(logo_path)
-
-    if logo_b64:
-        logo_html = f'<img src="data:image/png;base64,{logo_b64}" alt="Pixel11 Logo" />'
-    else:
-        logo_html = (
-            '<div style="width:66px;height:66px;border-radius:16px;'
-            'background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.10);'
-            'display:flex;align-items:center;justify-content:center;font-weight:950;">P</div>'
-        )
-
+    logo_html = (
+        f'<img src="data:image/png;base64,{logo_b64}" style="height:50px; border-radius:10px;"/>'
+        if logo_b64
+        else ""
+    )
     st.markdown(
         f"""
         <div class="px-nav">
-          <div class="px-nav-inner">
-            <div class="px-brand">
-              {logo_html}
-              <div class="px-brand-title">Pixel11</div>
+            <div style="display:flex; align-items:center; gap:20px;">
+                {logo_html}
+                <div style="font-size:24px; font-weight:950; letter-spacing:-1px;">
+                    PIXEL11 <span style="color:#7c3aed;">ENGINE</span>
+                </div>
             </div>
-          </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _background_bubbles() -> None:
-    st.markdown(
-        """
-        <div class="bg-bubbles">
-          <div class="bg-bubble bb1">✦</div>
-          <div class="bg-bubble big bb2">▶</div>
-          <div class="bg-bubble bb3">⚙</div>
-          <div class="bg-bubble big bb4">⌁</div>
-          <div class="bg-bubble bb5">⦿</div>
-          <div class="bg-bubble bb6">+</div>
-          <div class="bg-bubble big bb7">∞</div>
-          <div class="bg-bubble bb8">⧉</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _wave_divider() -> None:
-    html = """
-    <div class="wave-wrap fade-in">
-      <svg viewBox="0 0 1440 180" preserveAspectRatio="none" width="100%" height="180"
-           xmlns="http://www.w3.org/2000/svg">
-        <defs>
-          <linearGradient id="g1" x1="0" x2="1" y1="0" y2="0">
-            <stop offset="0%" stop-color="rgba(124,58,237,0.55)"/>
-            <stop offset="60%" stop-color="rgba(168,85,247,0.30)"/>
-            <stop offset="100%" stop-color="rgba(124,58,237,0.10)"/>
-          </linearGradient>
-        </defs>
-
-        <rect width="1440" height="180" fill="rgba(0,0,0,0)"/>
-        <path d="M0,120 C160,95 260,140 380,115 C520,85 620,150 770,118
-                 C930,84 1040,150 1180,110 C1300,78 1380,115 1440,95
-                 L1440,180 L0,180 Z"
-              fill="url(#g1)"/>
-
-        <path d="M0,140 C190,115 300,160 430,135 C560,110 680,165 820,138
-                 C980,108 1090,168 1220,130 C1340,95 1400,130 1440,110
-                 L1440,180 L0,180 Z"
-              fill="rgba(124,58,237,0.10)"/>
-      </svg>
-    </div>
-    """
-    components.html(html, height=190)
-
-
-def _log_card(messages: list) -> None:
-    st.markdown('<div class="card fade-in">', unsafe_allow_html=True)
-    st.markdown("### 🧾 Status")
-    for msg in messages:
-        st.markdown(
-            f"""
-            <div class="logline">
-              <span class="dot"></span>
-              <span style="font-weight:900;">{msg}</span>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def _results_card(df: pd.DataFrame, caption: str) -> None:
-    st.markdown('<div class="card fade-in">', unsafe_allow_html=True)
-    st.markdown("### 📊 Preview")
-    st.caption(caption)
-    st.dataframe(df, use_container_width=True, height=340)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def _download_card(excel_bytes: bytes, file_name: str) -> None:
-    st.markdown('<div class="card fade-in">', unsafe_allow_html=True)
-    st.markdown("### ⬇️ Export")
-    st.caption("Download the Excel file generated by the backend pipeline.")
-    st.download_button(
-        "📥 Download Excel",
-        data=excel_bytes,
-        file_name=file_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def _stats_card(stats: Dict[str, Any]) -> None:
-    st.markdown('<div class="card fade-in">', unsafe_allow_html=True)
-    st.markdown("### 📌 Summary")
-
-    raw_count = _safe_int(stats.get("raw_count", 0), 0)
-    clean_count = _safe_int(stats.get("clean_count", 0), 0)
-    with_web = _safe_int(stats.get("with_website", 0), 0)
-    no_web = _safe_int(stats.get("no_website", 0), 0)
-    with_rating = _safe_int(stats.get("with_rating", 0), 0)
-
-    case2_enabled = bool(stats.get("case2_enabled", False))
-    case2_ran = _safe_int(stats.get("case2_ran", 0), 0)
-    case2_err = _safe_int(stats.get("case2_errors", 0), 0)
-    case2_skip = _safe_int(stats.get("case2_skipped_no_website", 0), 0)
-    case2_max = _safe_int(stats.get("case2_max_leaders", 5), 5)
-
-    case2_line = "OFF"
-    if case2_enabled:
-        case2_line = f"ON • Leaders/Org: {case2_max} • Processed: {case2_ran} • Skipped(no website): {case2_skip} • Errors: {case2_err}"
-
-    st.markdown(
-        f"""
-        <div style="display:grid; grid-template-columns: 1fr 1fr; gap: .75rem;">
-          <div class="logline"><span class="dot"></span><span style="font-weight:900;">Raw: {raw_count}</span></div>
-          <div class="logline"><span class="dot"></span><span style="font-weight:900;">Clean: {clean_count}</span></div>
-          <div class="logline"><span class="dot"></span><span style="font-weight:900;">Has Website: {with_web}</span></div>
-          <div class="logline"><span class="dot"></span><span style="font-weight:900;">No Website: {no_web}</span></div>
-          <div class="logline" style="grid-column: 1 / -1;"><span class="dot"></span><span style="font-weight:900;">With Google Rating: {with_rating}</span></div>
-          <div class="logline" style="grid-column: 1 / -1;"><span class="dot"></span><span style="font-weight:900;">Case-2 (Top Management): {case2_line}</span></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def main() -> None:
-    st.set_page_config(
-        page_title="Data Mining Platform — Pixel11 Theme",
-        page_icon="🧩",
-        layout="wide",
-    )
-
+# -----------------------------
+# Main Application
+# -----------------------------
+def main():
+    st.set_page_config(page_title="Pixel11 Engine", layout="wide")
     _inject_css()
-    _background_bubbles()
     _navbar()
 
-    # Session state
     if "started" not in st.session_state:
         st.session_state.started = False
-    if "just_started" not in st.session_state:
-        st.session_state.just_started = False
+    if "results" not in st.session_state:
+        st.session_state.results = None
+        st.session_state.df = pd.DataFrame()
 
-    # Output state
-    if "result_df" not in st.session_state:
-        st.session_state.result_df = pd.DataFrame()
-        st.session_state.caption = "Run a search to preview real results."
-        st.session_state.excel_bytes = None
-        st.session_state.excel_name = None
-        st.session_state.stats = {}
-
-    # HERO
-    now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    st.markdown('<div style="padding: 5rem 0 2rem 0;">', unsafe_allow_html=True)
+    st.markdown('<div class="px-title">Discovery Reimagined.</div>', unsafe_allow_html=True)
     st.markdown(
-        f"""
-        <div class="px-hero fade-in">
-          <div class="px-title">Grow fast, Build faster</div>
-          <div class="px-subtitle">Search nearby organizations and export clean Excel — real output preview.</div>
-          <div class="px-meta">Status: <b>Ready ✅</b> • {now}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    _wave_divider()
-    st.write("")
-
-    # First screen CTA
-    if not st.session_state.started:
-        cta = st.button("🚀 Let’s get started", use_container_width=True)
-        if cta:
-            st.session_state.started = True
-            st.session_state.just_started = True
-            st.rerun()
-        return
-
-    # Anchor target
-    st.markdown('<div id="search" class="anchor"></div>', unsafe_allow_html=True)
-
-    # Smooth scroll after Get Started
-    if st.session_state.just_started:
-        st.markdown(
-            """
-            <script>
-              setTimeout(() => {
-                const el = document.getElementById("search");
-                if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-              }, 250);
-            </script>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.session_state.just_started = False
-
-    # Search card
-    st.markdown('<div class="card fade-in">', unsafe_allow_html=True)
-    st.markdown("### 🔎 Search")
-    st.caption("Case 1 (Google Places): results + website + rating. Case 2 can be enabled for leadership extraction (names + designation only).")
-
-    c1, c2, c3 = st.columns([1.15, 1.15, 1.4], gap="large")
-    with c1:
-        st.text_input("Enter your location", placeholder="Pune, Maharashtra", key="location_input")
-    with c2:
-        st.text_input("Enter specific place or area", placeholder="Bhosari / Chakan / Hinjewadi", key="place_input")
-    with c3:
-        st.text_input("Enter what you want to find", placeholder="manufacturing / hospitals / colleges", key="query_input")
-
-    a1, a2, a3, a4 = st.columns([1.0, 1.2, 1.25, 1.15], gap="large")
-    with a1:
-        st.number_input(
-            "How many results (max 100)",
-            min_value=1,
-            max_value=100,
-            value=20,
-            step=1,
-            key="top_n_input",
-        )
-    with a2:
-        st.toggle(
-            "Verbose terminal logs",
-            value=False,
-            key="debug_toggle",
-            help="Turn ON only if you want page-by-page logs in terminal.",
-        )
-    with a3:
-        st.toggle(
-            "Enable Case 2 (Top Management)",
-            value=False,
-            key="case2_toggle",
-            help="If ON, backend will scrape website pages and extract public top management (name + designation).",
-        )
-    with a4:
-        st.number_input(
-            "Case 2 leaders per org (max 5)",
-            min_value=1,
-            max_value=5,
-            value=5,
-            step=1,
-            key="case2_max_leaders_ui",
-            help="Top leaders to extract from each website.",
-        )
-
-    generate_clicked = st.button("✨ Generate Data", use_container_width=True)
-
-    st.markdown(
-        "<div style='color: rgba(244,244,247,0.70); font-weight:800; margin-top:.65rem;'>"
-        "Example: <b>hospitals</b> in <b>Hinjewadi</b>, <b>Pune</b></div>",
+        '<div style="text-align:center; opacity:0.5; letter-spacing:3px; font-weight:600;">GOOGLE PLACES • HYBRID LEADERSHIP MINING</div>',
         unsafe_allow_html=True,
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    if generate_clicked:
-        location = (st.session_state.get("location_input") or "").strip()
-        place = (st.session_state.get("place_input") or "").strip()
-        query = (st.session_state.get("query_input") or "").strip()
-        top_n = int(st.session_state.get("top_n_input") or 20)
-        top_n = max(1, min(top_n, 100))
-        debug = bool(st.session_state.get("debug_toggle", False))
+    if not st.session_state.started:
+        c1, c2, c3 = st.columns([1, 1.8, 1])
+        with c2:
+            if st.button("⚡ INITIALIZE ENGINE", use_container_width=True):
+                st.session_state.started = True
+                st.rerun()
+        return
 
-        case2_on = bool(st.session_state.get("case2_toggle", False))
-        case2_max_leaders = int(st.session_state.get("case2_max_leaders_ui") or 5)
-        case2_max_leaders = max(1, min(case2_max_leaders, 5))
+    with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("### 🛠️ Extraction Protocol")
 
-        # ✅ Set runtime env vars for backend config
-        os.environ["CASE2_ENABLED"] = "true" if case2_on else "false"
-        os.environ["CASE2_MAX_LEADERS"] = str(case2_max_leaders)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            loc = st.text_input("📍 Location", value="Pune")
+        with c2:
+            area = st.text_input("🏢 Area (Optional)")
+        with c3:
+            q = st.text_input("🔍 Business Niche", value="Software Companies")
 
-        if not location:
-            st.error("Please enter your location.")
-            st.stop()
-        if not query:
-            st.error("Please enter what you want to find.")
-            st.stop()
+        with st.expander("⚙️ Advanced Mining Settings"):
+            a1, a2, a3 = st.columns(3)
+            with a1:
+                # ✅ cap is now config-driven (300 if you set TOP_N_CAP=300)
+                limit = st.number_input("Max Results", 1, int(UI_TOP_N_CAP), 20)
+            with a2:
+                case2_on = st.toggle("Enable Case-2 Leadership (Hybrid)", value=True)
+            with a3:
+                lead_count = st.number_input("Leaders / Org", 1, 5, 5)
 
-        logs = [
-            f"Case 1 started… (Top N = {top_n})",
-            "Fetching Google Places…",
-            "Cleaning & de-duplication…",
-        ]
-        if case2_on:
-            logs.append(f"Case 2 enabled: extracting top {case2_max_leaders} leaders from websites…")
-        logs.append("Generating Excel…")
+        if st.button("🚀 EXECUTE PIPELINE", use_container_width=True):
+            if not loc or not q:
+                st.error("Input Required: Define Location and Query.")
+            else:
+                status_placeholder = st.empty()
+                with status_placeholder:
+                    st.markdown(f'<div class="card {"ai-active" if case2_on else ""}">', unsafe_allow_html=True)
+                    st.markdown("#### ⚙️ Processing Sequence")
+                    st.markdown(
+                        '<div class="logline"><div class="dot"></div>Initializing Mining Sequence...</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("</div>", unsafe_allow_html=True)
 
-        _log_card(logs)
+                try:
+                    with st.spinner("Mining Deep Intelligence..."):
+                        res = run_case1_pipeline(
+                            query=q,
+                            location=loc,
+                            place=area,
+                            top_n=int(limit),
+                            debug=True,
+                            case2_enabled=bool(case2_on),
+                            case2_max_leaders=int(lead_count),
+                        )
 
-        try:
-            with st.spinner("Fetching real results…"):
-                result = run_case1_pipeline(
-                    query=query,
-                    location=location,
-                    place=place,
-                    top_n=top_n,
-                    use_gpt=False,
-                    debug=debug,
+                        st.session_state.results = res
+                        st.session_state.df = _ensure_role_cols(pd.DataFrame(res.get("cleaned_rows", [])))
+                        status_placeholder.empty()
+                        st.balloons()
+                except Exception as e:
+                    status_placeholder.empty()
+                    st.error(f"❌ Pipeline Failed: {str(e)}")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if st.session_state.results:
+        res = st.session_state.results
+        stats = res.get("stats", {}) or {}
+
+        main_col, side_col = st.columns([3.2, 1])
+        with main_col:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.dataframe(st.session_state.df, use_container_width=True, height=550)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with side_col:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.metric("Total Found", stats.get("clean_count", 0))
+
+            # ✅ backend now returns both: with_leadership + with_leaders (safe)
+            leaders_val = stats.get("with_leadership", stats.get("with_leaders", 0))
+            st.metric("With Leaders", leaders_val)
+
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            if res.get("excel_bytes"):
+                st.markdown('<div class="card">', unsafe_allow_html=True)
+                st.download_button(
+                    label="📥 DOWNLOAD REPORT (.XLSX)",
+                    data=res["excel_bytes"],
+                    file_name="mining_report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
                 )
-        except Exception as e:
-            msg = str(e)
-            if "GOOGLE_PLACES_API_KEY" in msg:
-                st.error("❌ GOOGLE_PLACES_API_KEY missing. Set it in PowerShell or .env and rerun.")
-                st.info('PowerShell:  $env:GOOGLE_PLACES_API_KEY="YOUR_KEY"')
-            else:
-                st.error(f"❌ Error: {e}")
-            st.stop()
-
-        stats = result.get("stats", {}) or {}
-        cleaned_rows = result.get("cleaned_rows") or []
-        excel_bytes = result.get("excel_bytes")
-        excel_path = result.get("excel_path")
-
-        df = pd.DataFrame(cleaned_rows) if cleaned_rows else pd.DataFrame()
-        if (not excel_bytes) and excel_path:
-            excel_bytes = _read_bytes(excel_path)
-
-        raw_count = _safe_int(stats.get("raw_count", 0), 0)
-        clean_count = _safe_int(stats.get("clean_count", 0), len(df))
-
-        if not df.empty and excel_bytes:
-            st.session_state.result_df = df
-            st.session_state.stats = stats
-            st.session_state.caption = (
-                f"Real backend output • Raw: {raw_count} | Clean: {clean_count} | Showing: {min(len(df), top_n)}"
-            )
-            st.session_state.excel_bytes = excel_bytes
-            st.session_state.excel_name = os.path.basename(excel_path) if excel_path else (
-                f"case1_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            )
-            st.success("Done ✅ Data generated successfully.")
-        else:
-            st.session_state.result_df = pd.DataFrame()
-            st.session_state.stats = {}
-            st.session_state.excel_bytes = None
-            st.session_state.excel_name = None
-
-            if df.empty:
-                st.error("No results found. Try changing query/place or increase area (location).")
-            else:
-                st.error("Excel output missing. Check terminal logs.")
-
-    # Output layout
-    st.write("")
-    left, right = st.columns([3.2, 2], gap="large")
-
-    with left:
-        if st.session_state.result_df is not None and not st.session_state.result_df.empty:
-            _results_card(st.session_state.result_df, st.session_state.caption)
-        else:
-            st.markdown('<div class="card fade-in">', unsafe_allow_html=True)
-            st.markdown("### 📊 Preview")
-            st.caption(st.session_state.caption)
-            st.info("No data yet. Click **Generate Data** to fetch real results.")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    with right:
-        if st.session_state.stats:
-            _stats_card(st.session_state.stats)
-
-        if st.session_state.excel_bytes and st.session_state.excel_name:
-            _download_card(st.session_state.excel_bytes, st.session_state.excel_name)
-        else:
-            st.markdown('<div class="card fade-in">', unsafe_allow_html=True)
-            st.markdown("### ⬇️ Export")
-            st.caption("Run the pipeline to enable Excel download.")
-            st.info("Excel download will appear here after data is generated.")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-        st.markdown(
-            """
-            <div class="card fade-in" style="margin-top:1rem;">
-              <div style="font-weight:950; font-size:1.05rem; margin-bottom:.25rem;">✅ Notes</div>
-              <div style="color: rgba(244,244,247,0.70); font-weight:800;">• Case 1: nearby organizations + website + rating</div>
-              <div style="color: rgba(244,244,247,0.70); font-weight:800;">• Case 2: top management (name + designation only)</div>
-              <div style="color: rgba(244,244,247,0.70); font-weight:800;">• Try queries: “hospitals”, “colleges”, “manufacturing”, “schools”</div>
-              <div style="color: rgba(244,244,247,0.70); font-weight:800;">• Use Place to narrow: “Hinjewadi”, “Bhosari”, “Chakan”</div>
-              <div style="color: rgba(244,244,247,0.70); font-weight:800;">• Top N is capped at 100 (UI + backend)</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.markdown(
-        """
-        <div style="text-align:center; margin-top: 1.2rem; opacity:.78; font-size: 0.92rem; font-weight: 750;">
-          Built for real-time business discovery • Excel-ready output
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+                st.markdown("</div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

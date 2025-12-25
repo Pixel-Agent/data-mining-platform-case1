@@ -1,19 +1,11 @@
-# backend/excel_utils.py
-# GOOGLE PLACES ONLY Excel export
-# ✅ Case-1 + Case-2 (Top Management Names + Designation)
-# ✅ One row per company
-# ✅ Efficient + startup-grade formatting
-# ✅ Works with BOTH schemas:
-#    - Old miner output (Name/Website/Google Rating...)
-#    - New miner output (Company Name/Website URL/Rating Count...) etc.
-
 from __future__ import annotations
 
 from typing import List, Dict, Any
 import re
+import json
 
 import pandas as pd
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 
@@ -21,13 +13,16 @@ from openpyxl.utils import get_column_letter
 # Helpers
 # -----------------------------
 def _norm(s: Any) -> str:
-    return re.sub(r"\s+", " ", ("" if s is None else str(s)).strip())
+    s = "" if s is None else str(s)
+    return re.sub(r"\s+", " ", s.strip())
 
 
 def _pick(row: Dict[str, Any], *keys: str, default: Any = "") -> Any:
     for k in keys:
-        if k in row and row.get(k) not in (None, ""):
-            return row.get(k)
+        if k in row:
+            val = row.get(k)
+            if val not in (None, "", "null", "N/A", "na", "None", "NULL"):
+                return val
     return default
 
 
@@ -35,110 +30,38 @@ def _yes_no(v: Any) -> str:
     if isinstance(v, bool):
         return "Yes" if v else "No"
     s = _norm(v).lower()
-    if s in {"yes", "true", "1"}:
-        return "Yes"
-    if s in {"no", "false", "0"}:
-        return "No"
-    return ""
+    return "Yes" if s in {"yes", "true", "1", "y"} else "No"
 
 
 def _to_number_or_blank(x: Any) -> Any:
-    """
-    Keep rating/count numeric if possible; else blank.
-    """
-    if x in (None, ""):
-        return ""
     try:
         s = str(x).strip()
-        if not s:
+        if not s or s.lower() in {"nan", "none", "null"}:
             return ""
-        # allow float/int
-        if "." in s:
-            return float(s)
-        return int(float(s))
+        f = float(s.replace(",", ""))
+        return int(f) if f.is_integer() else f
     except Exception:
         return ""
 
 
-def _leaders_list(row: Dict[str, Any]) -> List[Dict[str, str]]:
-    """
-    Accepts:
-      - row["case2_leaders"] as list of {"name","designation"}
-      - row["leaders"] wrapper
-    Returns max 5.
-    """
-    val = row.get("case2_leaders") or row.get("leaders") or []
-    if isinstance(val, dict) and "leaders" in val:
-        val = val.get("leaders") or []
-    if not isinstance(val, list):
-        return []
-
-    out: List[Dict[str, str]] = []
-    for item in val:
-        if not isinstance(item, dict):
-            continue
-        nm = _norm(item.get("name"))
-        ds = _norm(item.get("designation"))
-        if not nm:
-            continue
-        out.append({"name": nm, "designation": ds})
-        if len(out) >= 5:
-            break
-    return out
-
-
-def _build_excel_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize any incoming row into the final Excel schema.
-    """
-    company_name = _norm(_pick(row, "Company Name", "Name", "company_name", default="Unknown"))
-    industry = _norm(_pick(row, "Industry", "Primary Category", "industry", "raw_category", default="Business / Services"))
-
-    rating = _to_number_or_blank(_pick(row, "Google Rating", "google_rating", default=""))
-    rating_count = _to_number_or_blank(_pick(row, "Rating Count", "Google Rating Count", "google_rating_count", default=""))
-
-    has_web = _pick(row, "Has Website", "has_website", default="")
-    has_web = _yes_no(has_web)
-
-    website_url = _norm(_pick(row, "Website URL", "Website", "website_url", "website", default=""))
-    if not has_web:
-        has_web = "Yes" if website_url else "No"
-
-    source_name = _norm(_pick(row, "Source Name", "source_name", default="google_places"))
-    source_url = _norm(_pick(row, "Source URL", "source_url", default=""))
-
-    # Leaders (Top 5) - prefer list if present
-    leaders = _leaders_list(row)
-
-    out: Dict[str, Any] = {
-        "Company Name": company_name,
-        "Industry": industry,
-        "Google Rating": rating,
-        "Rating Count": rating_count,
-        "Has Website": has_web,
-        "Website URL": website_url,
-    }
-
-    # ✅ If leaders list not present, fallback to already-flattened columns (Leader 1..5)
-    if not leaders:
-        for i in range(1, 6):
-            out[f"Leader {i} Name"] = _norm(_pick(row, f"Leader {i} Name", default=""))
-            out[f"Leader {i} Designation"] = _norm(_pick(row, f"Leader {i} Designation", default=""))
-    else:
-        for i in range(5):
-            nm = leaders[i]["name"] if i < len(leaders) else ""
-            ds = leaders[i]["designation"] if i < len(leaders) else ""
-            out[f"Leader {i+1} Name"] = nm
-            out[f"Leader {i+1} Designation"] = ds
-
-    out["Source Name"] = source_name
-    out["Source URL"] = source_url
-
-    return out
+def _safe_json_load(x: Any) -> Any:
+    if x is None:
+        return None
+    if isinstance(x, (dict, list)):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+    return None
 
 
 # -----------------------------
-# Final column order (LOCKED)
+# FINAL EXCEL SCHEMA (LOCKED)
 # -----------------------------
 FINAL_COLS: List[str] = [
     "Company Name",
@@ -147,110 +70,227 @@ FINAL_COLS: List[str] = [
     "Rating Count",
     "Has Website",
     "Website URL",
-    "Leader 1 Name",
-    "Leader 1 Designation",
-    "Leader 2 Name",
-    "Leader 2 Designation",
-    "Leader 3 Name",
-    "Leader 3 Designation",
-    "Leader 4 Name",
-    "Leader 4 Designation",
-    "Leader 5 Name",
-    "Leader 5 Designation",
+    "Contact Phone",
+    "Contact Email",
+    "Address",
+    "Place ID",
     "Source Name",
     "Source URL",
+    "Leadership Found",
+    "Name 1",
+    "Designation 1",
+    "Name 2",
+    "Designation 2",
+    "Name 3",
+    "Designation 3",
+    "Name 4",
+    "Designation 4",
+    "Name 5",
+    "Designation 5",
 ]
 
 
+# Buckets order (must match Case-2 structure)
+BUCKETS_ORDER = [
+    "Executive Leadership",
+    "Technology / Operations",
+    "Finance / Administration",
+    "Business Development / Growth",
+    "Marketing / Branding",
+]
+
+
+def _flatten_case2_management_to_names(case2_management: Any) -> Dict[str, str]:
+    """
+    Convert bucket dict -> Name 1..5, Designation 1..5 (strict order).
+    Accepts dict or json-string.
+    """
+    out: Dict[str, str] = {}
+    for i in range(1, 6):
+        out[f"Name {i}"] = ""
+        out[f"Designation {i}"] = ""
+
+    mgmt = _safe_json_load(case2_management) or {}
+    if not isinstance(mgmt, dict):
+        return out
+
+    idx = 1
+    for bucket in BUCKETS_ORDER:
+        if idx > 5:
+            break
+        v = mgmt.get(bucket) or {}
+        if not isinstance(v, dict):
+            continue
+        nm = _norm(v.get("name", ""))
+        dg = _norm(v.get("designation", v.get("role", "")))
+        if nm and dg:
+            out[f"Name {idx}"] = nm
+            out[f"Designation {idx}"] = dg
+            idx += 1
+
+    return out
+
+
+def _flatten_case2_leaders_legacy(case2_leaders: Any) -> Dict[str, str]:
+    """
+    Legacy support: case2_leaders = [{name, role}, ...]
+    """
+    out: Dict[str, str] = {}
+    for i in range(1, 6):
+        out[f"Name {i}"] = ""
+        out[f"Designation {i}"] = ""
+
+    leaders = _safe_json_load(case2_leaders) or []
+    if not isinstance(leaders, list):
+        return out
+
+    for i in range(1, 6):
+        idx = i - 1
+        if idx < len(leaders) and isinstance(leaders[idx], dict):
+            out[f"Name {i}"] = _norm(leaders[idx].get("name", ""))
+            out[f"Designation {i}"] = _norm(leaders[idx].get("role", ""))
+    return out
+
+
+# -----------------------------
+# Row Builder
+# -----------------------------
+def _build_excel_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "Company Name": _norm(_pick(row, "Company Name", "name", "company_name", default="Unknown")),
+        "Industry": _norm(_pick(row, "Industry", "industry", "Category", "primaryType", default="Business")),
+        "Google Rating": _to_number_or_blank(_pick(row, "Google Rating", "rating", "google_rating")),
+        "Rating Count": _to_number_or_blank(
+            _pick(row, "Rating Count", "Reviews", "userRatingCount", "rating_count", "google_rating_count")
+        ),
+        "Has Website": "Yes" if _pick(row, "Website URL", "website", "websiteUri") else _yes_no(
+            _pick(row, "Has Website", "has_website")
+        ),
+        "Website URL": _norm(_pick(row, "Website URL", "website", "websiteUri", "website_url")),
+        "Contact Phone": _norm(
+            _pick(
+                row,
+                "Contact Phone",
+                "nationalPhoneNumber",
+                "internationalPhoneNumber",
+                "phone",
+                "contact_phone",
+            )
+        ),
+        "Contact Email": _norm(_pick(row, "Contact Email", "email", "contact_email")),
+        "Address": _norm(_pick(row, "Address", "formattedAddress", "address")),
+        "Place ID": _norm(_pick(row, "Place ID", "google_place_id", "place_id", "id")),
+        "Source Name": _norm(_pick(row, "Source Name", "source_name", default="Google Places")) or "Google Places",
+        "Source URL": _norm(_pick(row, "Source URL", "googleMapsUri", "url", "source_url")),
+    }
+
+    # ---------------------------------------------------------
+    # Leaders priority (MOST IMPORTANT for your new pipeline)
+    # 1) If miner already set Name/Designation 1..5 -> use them
+    # 2) else if case2_management exists -> flatten buckets
+    # 3) else legacy case2_leaders list
+    # ---------------------------------------------------------
+    has_flat = False
+    for i in range(1, 6):
+        n = _norm(row.get(f"Name {i}", ""))
+        d = _norm(row.get(f"Designation {i}", ""))
+        if n or d:
+            has_flat = True
+            break
+
+    if has_flat:
+        for i in range(1, 6):
+            out[f"Name {i}"] = _norm(row.get(f"Name {i}", ""))
+            out[f"Designation {i}"] = _norm(row.get(f"Designation {i}", ""))
+    else:
+        # try case2_management (new)
+        flat_from_mgmt = _flatten_case2_management_to_names(row.get("case2_management"))
+        if any(flat_from_mgmt.get(f"Name {i}") for i in range(1, 6)):
+            for i in range(1, 6):
+                out[f"Name {i}"] = flat_from_mgmt.get(f"Name {i}", "")
+                out[f"Designation {i}"] = flat_from_mgmt.get(f"Designation {i}", "")
+        else:
+            # legacy support
+            flat_legacy = _flatten_case2_leaders_legacy(row.get("case2_leaders"))
+            for i in range(1, 6):
+                out[f"Name {i}"] = flat_legacy.get(f"Name {i}", "")
+                out[f"Designation {i}"] = flat_legacy.get(f"Designation {i}", "")
+
+    # Leadership Found:
+    # - if pipeline already set strict flag, use it
+    # - else compute from Name1+Designation1
+    lf = _norm(row.get("Leadership Found", ""))
+    if lf in {"Yes", "No"}:
+        out["Leadership Found"] = lf
+    else:
+        out["Leadership Found"] = "Yes" if out["Name 1"] and out["Designation 1"] else "No"
+
+    return out
+
+
+# -----------------------------
+# Excel Writer
+# -----------------------------
 def write_case1_excel(rows: List[Dict[str, Any]], out_path: str) -> None:
-    """
-    Writes Case-1 + Case-2 output to a single clean Excel sheet: "Results"
-
-    Output:
-      - One row per company
-      - Top 5 leaders (Name + Designation)
-      - No personal contacts
-      - Clean formatting + reasonable column widths
-    """
-    # Normalize
-    normalized: List[Dict[str, Any]] = []
-    for r in (rows or []):
-        rr = dict(r) if isinstance(r, dict) else {}
-        normalized.append(_build_excel_row(rr))
-
+    normalized = [_build_excel_row(dict(r)) for r in (rows or [])]
     df = pd.DataFrame(normalized)
+
     if df.empty:
         df = pd.DataFrame(columns=FINAL_COLS)
+    else:
+        for col in FINAL_COLS:
+            if col not in df.columns:
+                df[col] = ""
+        df = df[FINAL_COLS]
 
-    # Ensure all expected columns exist + enforce order
-    for c in FINAL_COLS:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[FINAL_COLS]
-
-    # Write Excel
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
-        sheet_name = "Results"
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        df.to_excel(writer, index=False, sheet_name="Mining Results")
+        ws = writer.book["Mining Results"]
 
-        ws = writer.book[sheet_name]
-
-        # ---- Styling ----
         ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
 
-        header_font = Font(bold=True)
-        header_align = Alignment(vertical="center", wrap_text=True)
-        body_align = Alignment(vertical="top", wrap_text=False)
+        header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
 
-        # Header
-        for cell in ws[1]:
+        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+        thin_border = Border(
+            left=Side(style="thin"),
+            right=Side(style="thin"),
+            top=Side(style="thin"),
+            bottom=Side(style="thin"),
+        )
+
+        # Header styling
+        for i, col_name in enumerate(FINAL_COLS, start=1):
+            cell = ws.cell(row=1, column=i)
+            cell.fill = header_fill
             cell.font = header_font
-            cell.alignment = header_align
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-        # Body alignment default
+        # Column widths
+        wide_cols = {"Company Name", "Website URL", "Source URL", "Contact Email", "Address"}
+        for i, col_name in enumerate(FINAL_COLS, start=1):
+            letter = get_column_letter(i)
+            if col_name in wide_cols:
+                ws.column_dimensions[letter].width = 42
+            elif col_name == "Place ID":
+                ws.column_dimensions[letter].width = 26
+            elif "Name" in col_name or "Designation" in col_name:
+                ws.column_dimensions[letter].width = 30
+            else:
+                ws.column_dimensions[letter].width = 16
+
+        # Borders + wrap + Leadership Found conditional color
+        lf_col = FINAL_COLS.index("Leadership Found") + 1
         for r in range(2, ws.max_row + 1):
             for c in range(1, ws.max_column + 1):
-                ws.cell(row=r, column=c).alignment = body_align
+                cell = ws.cell(row=r, column=c)
+                cell.border = thin_border
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
 
-        # Wrap columns
-        wrap_cols = {
-            "Website URL",
-            "Leader 1 Name", "Leader 1 Designation",
-            "Leader 2 Name", "Leader 2 Designation",
-            "Leader 3 Name", "Leader 3 Designation",
-            "Leader 4 Name", "Leader 4 Designation",
-            "Leader 5 Name", "Leader 5 Designation",
-            "Source URL",
-        }
-        col_index = {name: i + 1 for i, name in enumerate(FINAL_COLS)}
-        for col_name in wrap_cols:
-            idx = col_index.get(col_name)
-            if not idx:
-                continue
-            for r in range(2, ws.max_row + 1):
-                ws.cell(row=r, column=idx).alignment = Alignment(wrap_text=True, vertical="top")
+            lf_cell = ws.cell(row=r, column=lf_col)
+            lf_cell.fill = green_fill if str(lf_cell.value).strip() == "Yes" else red_fill
 
-        # Slightly bigger header row
-        ws.row_dimensions[1].height = 22
-
-        # Efficient column widths (fast)
-        # clamp to keep professional
-        for i, col in enumerate(FINAL_COLS, start=1):
-            if df.empty:
-                max_len = len(col)
-            else:
-                # only first 400 rows for speed
-                vals = df[col].astype(str).head(400).tolist()
-                max_len = max([len(col)] + [len(v) for v in vals])
-
-            if col in {"Website URL", "Source URL"}:
-                width = min(max(18, max_len + 2), 55)
-            elif "Designation" in col:
-                width = min(max(16, max_len + 2), 42)
-            elif "Leader" in col:
-                width = min(max(14, max_len + 2), 30)
-            else:
-                width = min(max(14, max_len + 2), 32)
-
-            ws.column_dimensions[get_column_letter(i)].width = width
+    print(f"✅ Excel Generation Successful: {out_path}")

@@ -1,207 +1,407 @@
 # backend/agent_logic_case2.py
-# Case-2 — Website Top-Level Management (Top 5 leaders)
-# ✅ Names + Designation ONLY
-# ✅ No role-buckets, no email/phone/LinkedIn
-# ✅ Works with scraper_case2.py (returns leaders)
-# ✅ Adds time guards to prevent hanging
+# Case 2 — SCRAPING-FIRST (Top Management + Contact Email)
+# -------------------------------------------------------
+# Streamlit-safe | DB-safe | Excel-safe
+#
+# Primary path:
+#   backend/scraper_case2.py  -> run_discovery_sync() -> (payload, email)
+#
+# Output formats:
+# 1) output["case2_leaders"] = [{"name": "...", "role": "..."}]  (legacy friendly)
+# 2) output["case2_management"] = {
+#      "Executive Leadership": {"name","designation","email","phone","linkedin"},
+#      ...
+#    } (bucket dict)
+#
+# NOTE:
+# - Excel final schema is handled by miner/excel_utils (Name 1..5 / Designation 1..5)
+# - This module only enriches and returns normalized Case-2 payload.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 import re
-import os
-import time
+import json
 
-from backend.scraper_case2 import scrape_management_from_website
-from backend.config import CASE2_MAX_LEADERS, CASE2_TIMEOUT_SECS
+from backend.config import (
+    CASE2_ENABLED,
+    CASE2_MAX_LEADERS,
+)
+
+# SCRAPING-FIRST module (payload-first)
+from backend.scraper_case2 import run_discovery_sync
+
+# Optional DB cache (72h TTL) — safe import
+try:
+    from backend import db  # type: ignore
+except Exception:
+    db = None  # type: ignore
 
 
 # -----------------------------
-# Helpers
+# Limits / helpers
 # -----------------------------
-def _norm(x: Any) -> str:
-    return re.sub(r"\s+", " ", ("" if x is None else str(x)).strip())
+def _max_leaders() -> int:
+    try:
+        return max(1, min(int(CASE2_MAX_LEADERS or 5), 5))
+    except Exception:
+        return 5
 
 
-def _has_contact_noise(s: str) -> bool:
-    t = (s or "").lower()
-    if "@" in t:
-        return True
-    if re.search(r"\+?\d[\d\-\s]{7,}", t):
-        return True
-    if "linkedin" in t or "facebook" in t or "instagram" in t or "twitter" in t:
-        return True
-    return False
+def _norm(s: Any) -> str:
+    return re.sub(r"\s+", " ", ("" if s is None else str(s)).strip())
 
 
-def _clean_person(p: Any) -> Dict[str, str]:
+def _safe_json_load(x: Any) -> Any:
+    if x is None:
+        return None
+    if isinstance(x, (dict, list)):
+        return x
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
+    return None
+
+
+# -----------------------------
+# Buckets (FINAL)
+# -----------------------------
+BUCKETS = [
+    "Executive Leadership",
+    "Technology / Operations",
+    "Finance / Administration",
+    "Business Development / Growth",
+    "Marketing / Branding",
+]
+
+
+def _empty_management() -> Dict[str, Dict[str, str]]:
+    base = {"name": "", "designation": "", "email": "", "phone": "", "linkedin": ""}
+    return {b: dict(base) for b in BUCKETS}
+
+
+def _leadership_found_strict(mgmt: Dict[str, Dict[str, str]]) -> bool:
     """
-    Enforce strict output:
-      {"name": "...", "designation": "..."}
+    STRICT rule (as per master prompt):
+    Leadership Found = Yes only if Executive Leadership has BOTH:
+      - name
+      - designation
     """
-    if not isinstance(p, dict):
-        return {"name": "", "designation": ""}
-
-    name = _norm(p.get("name", ""))
-    designation = _norm(p.get("designation", ""))
-
-    # STRICT: no contacts
-    if _has_contact_noise(name) or _has_contact_noise(designation):
-        return {"name": "", "designation": ""}
-
-    # name must exist
-    if not name:
-        return {"name": "", "designation": ""}
-
-    return {"name": name, "designation": designation}
+    d0 = mgmt.get("Executive Leadership") or {}
+    return bool(_norm(d0.get("name", "")) and _norm(d0.get("designation", "")))
 
 
-def _dedupe_leaders(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    seen = set()
+# -----------------------------
+# Role normalization -> 5 buckets (only used if payload has only leaders list)
+# -----------------------------
+_BUCKET_RULES: List[Tuple[str, List[str]]] = [
+    (
+        "Executive Leadership",
+        [
+            "founder", "co-founder", "cofounder", "ceo", "chief executive", "managing director",
+            "md", "director", "executive director", "chairman", "chairperson", "president",
+            "principal", "dean", "medical director", "clinical director", "owner", "proprietor",
+        ],
+    ),
+    (
+        "Technology / Operations",
+        [
+            "cto", "chief technology", "cio", "chief information", "coo", "chief operating",
+            "operations", "it head", "technical", "plant head", "head of operations", "administrator",
+        ],
+    ),
+    (
+        "Finance / Administration",
+        [
+            "cfo", "chief financial", "finance", "accounts", "controller", "treasurer",
+            "admin", "administration", "hr head", "human resources", "compliance",
+        ],
+    ),
+    (
+        "Business Development / Growth",
+        [
+            "business development", "bd", "growth", "strategy", "partnership", "sales head",
+            "admissions", "placement", "revenue", "commercial",
+        ],
+    ),
+    (
+        "Marketing / Branding",
+        [
+            "cmo", "chief marketing", "marketing", "brand", "communications", "pr",
+            "digital marketing", "outreach", "social media",
+        ],
+    ),
+]
+
+
+def _map_role_to_bucket(role: str) -> str:
+    r = _norm(role).lower()
+    if not r:
+        return ""
+    for bucket, keys in _BUCKET_RULES:
+        for k in keys:
+            if k in r:
+                return bucket
+    return ""  # strict: do not guess
+
+
+def _clean_leaders_list(value: Any, max_leaders: int = 5) -> List[Dict[str, str]]:
+    """
+    Normalize leaders -> [{"name":"...","role":"..."}] strict.
+    Accepts:
+      - list[dict]
+      - dict {"leaders":[...]} or {"leaders_raw":[...]}
+      - JSON string of above
+    """
+    if max_leaders <= 0:
+        max_leaders = 5
+
+    parsed = _safe_json_load(value)
+    if parsed is not None:
+        value = parsed
+
+    if isinstance(value, dict):
+        value = value.get("leaders_raw") or value.get("leaders") or []
+
+    if not isinstance(value, list):
+        return []
+
     out: List[Dict[str, str]] = []
-    for p in items:
-        name = _norm(p.get("name", "")).lower()
-        des = _norm(p.get("designation", "")).lower()
-        if not name:
+    seen = set()
+    for it in value:
+        if not isinstance(it, dict):
             continue
-        key = (name, des)
+        nm = _norm(it.get("name", ""))
+        rl = _norm(it.get("role", "")) or _norm(it.get("designation", ""))
+        if not nm or not rl:
+            continue
+        key = nm.lower()
         if key in seen:
             continue
         seen.add(key)
-        out.append({"name": _norm(p.get("name", "")), "designation": _norm(p.get("designation", ""))})
+        out.append({"name": nm, "role": rl})
+        if len(out) >= max_leaders:
+            break
     return out
 
 
-def _leaders_to_excel_cols(leaders: List[Dict[str, str]], max_leaders: int = 5) -> Dict[str, str]:
+def _leaders_to_management(leaders: List[Dict[str, str]], email: str = "") -> Dict[str, Dict[str, str]]:
     """
-    Convert leaders list -> flat Excel columns:
-      Leader 1 Name, Leader 1 Designation, ... Leader 5 Name, Leader 5 Designation
+    Convert leaders list -> 5 bucket dict.
+    Strict: only fill a bucket if mapping is confident (keyword match).
     """
-    n = max(1, min(int(max_leaders), 5))
-    out: Dict[str, str] = {}
-    for i in range(1, n + 1):
-        out[f"Leader {i} Name"] = ""
-        out[f"Leader {i} Designation"] = ""
+    mgmt = _empty_management()
+    seen_buckets = set()
 
-    for idx, p in enumerate(leaders[:n], start=1):
-        out[f"Leader {idx} Name"] = _norm(p.get("name", ""))
-        out[f"Leader {idx} Designation"] = _norm(p.get("designation", ""))
-
-    return out
-
-
-# -----------------------------
-# Core API
-# -----------------------------
-def run_case2_top_management(
-    website: str,
-    max_leaders: int | None = None,
-    debug_hint: str = "",
-) -> Tuple[List[Dict[str, str]], Dict[str, Any]]:
-    """
-    website -> scrape -> return top leaders
-
-    Returns:
-      (leaders_list, meta)
-
-    leaders_list:
-      [
-        {"name": "...", "designation": "..."},
-        ... up to max_leaders
-      ]
-    """
-
-    n = int(max_leaders or CASE2_MAX_LEADERS)
-    n = max(1, min(n, 5))
-
-    meta: Dict[str, Any] = {
-        "website": _norm(website),
-        "count_scraped": 0,
-        "max_leaders": n,
-        "hint": _norm(debug_hint),
-    }
-
-    if not website or not isinstance(website, str):
-        return ([], meta)
-
-    website = website.strip()
-    if not (website.startswith("http://") or website.startswith("https://")):
-        website = "https://" + website
-
-    # ✅ Per-website guard: don't let one org eat too much time
-    # You can override with env: CASE2_PER_SITE_TIMEOUT_SECS
-    per_site_cap = int(os.getenv("CASE2_PER_SITE_TIMEOUT_SECS", str(max(10, CASE2_TIMEOUT_SECS * 2))))
-    per_site_cap = max(10, min(per_site_cap, 90))
-
-    t0 = time.time()
-    people = scrape_management_from_website(website, max_leaders=n) or []
-    elapsed = time.time() - t0
-
-    meta["elapsed_secs"] = round(elapsed, 2)
-    meta["per_site_cap_secs"] = per_site_cap
-
-    # If scraping took too long, still return whatever we got (no crash)
-    # (scraper itself uses request timeouts; this is just a safety meta)
-    meta["count_scraped"] = len(people)
-
-    leaders: List[Dict[str, str]] = []
-    for p in people:
-        cp = _clean_person(p)
-        if not cp["name"]:
+    for it in leaders or []:
+        name = _norm(it.get("name", ""))
+        role = _norm(it.get("role", "")) or _norm(it.get("designation", ""))
+        if not name or not role:
             continue
-        leaders.append(cp)
-        if len(leaders) >= n:
+
+        bucket = _map_role_to_bucket(role)
+        if not bucket:
+            continue
+        if bucket in seen_buckets:
+            continue
+
+        mgmt[bucket]["name"] = name
+        mgmt[bucket]["designation"] = role
+
+        # safe default: only attach email to Executive bucket
+        if bucket == "Executive Leadership" and email:
+            mgmt[bucket]["email"] = _norm(email)
+
+        seen_buckets.add(bucket)
+
+        if len(seen_buckets) >= 5:
             break
 
-    leaders = _dedupe_leaders(leaders)[:n]
-    return (leaders, meta)
+    return mgmt
 
 
-def enrich_company_record_with_case2(record: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_management_from_payload(payload: Any, email: str = "") -> Dict[str, Dict[str, str]]:
     """
-    Mutates and returns record:
-      record["case2_leaders"] = [{"name":..,"designation":..}, ... up to 5]
-      record["case2_meta"]    = {...}
-      record["Leader 1 Name"], "Leader 1 Designation", ... (flat Excel columns)
+    scraper_case2 payload-first normalizer:
+      payload["case2_management"] is authoritative if present.
+
+    Expected mgmt shape:
+      {bucket: {"name":"", "designation":"", ...}} (extra keys allowed)
     """
-    if not isinstance(record, dict):
-        return record
+    base = _empty_management()
 
-    website = (
-        record.get("Website URL")
-        or record.get("website_url")
-        or record.get("Website")
-        or record.get("website")
-        or ""
+    if not isinstance(payload, dict):
+        return base
+
+    mgmt = payload.get("case2_management")
+    if isinstance(mgmt, str):
+        mgmt = _safe_json_load(mgmt)
+
+    if isinstance(mgmt, dict):
+        for b in BUCKETS:
+            v = mgmt.get(b)
+            if isinstance(v, dict):
+                nm = _norm(v.get("name", ""))
+                dg = _norm(v.get("designation", "")) or _norm(v.get("role", ""))
+                if nm and dg:
+                    base[b]["name"] = nm
+                    base[b]["designation"] = dg
+
+                    # pass-through optional fields if present
+                    base[b]["email"] = _norm(v.get("email", "")) or base[b]["email"]
+                    base[b]["phone"] = _norm(v.get("phone", "")) or base[b]["phone"]
+                    base[b]["linkedin"] = _norm(v.get("linkedin", "")) or base[b]["linkedin"]
+
+        # if still no explicit email in mgmt but email discovered, attach to Executive
+        if email and not base["Executive Leadership"]["email"]:
+            base["Executive Leadership"]["email"] = _norm(email)
+
+        return base
+
+    # fallback: leaders list in payload
+    leaders = _clean_leaders_list(payload, max_leaders=_max_leaders())
+    return _leaders_to_management(leaders, email=email)
+
+
+# ------------------------------------------------------------
+# Optional cache helpers (safe no-crash)
+# ------------------------------------------------------------
+def _cache_get(cache_key: str) -> Optional[Dict[str, Any]]:
+    if not db:
+        return None
+    fn = getattr(db, "get_case2_cache", None)
+    if callable(fn):
+        try:
+            return fn(cache_key)
+        except Exception:
+            return None
+    return None
+
+
+def _cache_set(cache_key: str, payload: Dict[str, Any]) -> None:
+    if not db:
+        return
+    fn = getattr(db, "save_case2_cache", None)
+    if callable(fn):
+        try:
+            fn(cache_key, payload)
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------
+# Public API (SCRAPING-FIRST)
+# ------------------------------------------------------------
+def run_case2_enrichment(
+    company_name: str,
+    website_url: str,
+    cache_key: str = "",
+) -> Dict[str, Any]:
+    """
+    Main Case-2 entry (SCRAPING-FIRST).
+    Returns a dict safe for Streamlit + pipeline.
+
+    Output keys:
+      - case2_leaders: list[{"name","role"}]
+      - case2_email: str
+      - case2_management: 5-bucket dict (name/designation/email/phone/linkedin)
+      - Leadership Found: "Yes"/"No" (STRICT Executive rule)
+    """
+    out: Dict[str, Any] = {
+        "case2_leaders": [],
+        "case2_email": "",
+        "case2_management": _empty_management(),
+        "Leadership Found": "No",
+    }
+
+    if not CASE2_ENABLED:
+        return out
+
+    website_url = _norm(website_url)
+    company_name = _norm(company_name)
+
+    if not website_url:
+        return out
+
+    # 1) Cache (optional)
+    if cache_key:
+        cached = _cache_get(cache_key)
+        if isinstance(cached, dict):
+            # Make sure required keys exist (avoid old cache shape breaking caller)
+            cached.setdefault("case2_leaders", [])
+            cached.setdefault("case2_email", "")
+            cached.setdefault("case2_management", _empty_management())
+            cached.setdefault("Leadership Found", "No")
+            return cached
+
+    # 2) Scrape payload + email (scraper_case2)
+    payload: Dict[str, Any] = {}
+    email: str = ""
+    try:
+        # preferred keyword signature
+        payload, email = run_discovery_sync(website=website_url, company_name=company_name)
+    except TypeError:
+        # backward positional support
+        payload, email = run_discovery_sync(website_url, company_name)
+
+    email = _norm(email)
+
+    # leaders list (legacy friendly)
+    leaders = _clean_leaders_list(payload.get("leaders_raw") if isinstance(payload, dict) else payload, max_leaders=_max_leaders())
+    out["case2_leaders"] = leaders
+    out["case2_email"] = email
+
+    # management buckets
+    mgmt = _normalize_management_from_payload(payload, email=email)
+    out["case2_management"] = mgmt
+    out["Leadership Found"] = "Yes" if _leadership_found_strict(mgmt) else "No"
+
+    # 3) Save cache (optional)
+    if cache_key:
+        _cache_set(cache_key, out)
+
+    return out
+
+
+# ------------------------------------------------------------
+# Backward compatibility wrapper (legacy)
+# ------------------------------------------------------------
+def run_case2_top_management(company_name: str, website_url: str) -> Dict[str, Any]:
+    """
+    Legacy wrapper kept for older code paths.
+    It returns:
+      - case2_leaders (list)
+      - flat "Leader i Name/Role" columns (1..5)
+    """
+    output: Dict[str, Any] = {}
+    max_leaders = _max_leaders()
+
+    # Always initialize legacy columns
+    for i in range(1, 6):
+        output[f"Leader {i} Name"] = ""
+        output[f"Leader {i} Role"] = ""
+
+    if not CASE2_ENABLED:
+        output["case2_leaders"] = []
+        return output
+
+    data = run_case2_enrichment(
+        company_name=company_name or "",
+        website_url=website_url or "",
+        cache_key="",  # legacy wrapper doesn't force caching
     )
-    website = _norm(website)
 
-    hint = " ".join(
-        [
-            _norm(record.get("Company Name") or record.get("Name") or record.get("company_name") or ""),
-            _norm(record.get("Industry") or record.get("Primary Category") or record.get("industry") or ""),
-        ]
-    ).strip()
+    leaders = (data.get("case2_leaders") or [])[:max_leaders]
+    output["case2_leaders"] = leaders
 
-    leaders, meta = run_case2_top_management(
-        website=website,
-        max_leaders=int(CASE2_MAX_LEADERS),
-        debug_hint=hint,
-    )
+    for idx, leader in enumerate(leaders[:5]):
+        col = idx + 1
+        output[f"Leader {col} Name"] = _norm(leader.get("name", "")) or ""
+        output[f"Leader {col} Role"] = _norm(leader.get("role", "")) or ""
 
-    # attach list + meta
-    record["case2_leaders"] = leaders
-    record["case2_meta"] = meta
-
-    # ✅ attach flat Excel columns (super important)
-    flat = _leaders_to_excel_cols(leaders, max_leaders=int(CASE2_MAX_LEADERS))
-    record.update(flat)
-
-    return record
-
-
-if __name__ == "__main__":
-    leaders, meta = run_case2_top_management("https://www.tcs.com", max_leaders=5, debug_hint="company")
-    print(meta)
-    for x in leaders:
-        print(x)
+    return output

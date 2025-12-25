@@ -7,7 +7,7 @@ from backend.db import (
     insert_business_list,
     add_search_history,
 )
-from backend.scraper import scrape_case1_to_raw
+from backend.scraper1 import scrape_case1_to_raw
 from backend.miner import clean_and_process
 from backend.excel_utils import generate_excel_from_business_list
 

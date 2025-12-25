@@ -1,29 +1,43 @@
-# backend/agent_logic_case1.py
-# Case 1 — GOOGLE PLACES ONLY pipeline
-# ✅ Case-2 integration (Top 5 leaders from website)
-# ✅ No-hang guards (org limit + total time cap)
-# ✅ Excel-ready flatten: Leader 1..5 Name/Designation
-# ✅ No GPT required
-
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 import os
 import time
+import sys
+import json
+import re
+import requests
 
+# -----------------------------
+# Path safety
+# -----------------------------
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+# -----------------------------
+# Imports
+# -----------------------------
 from backend.config import (
     DEFAULT_LOCATION,
     DEFAULT_TOP_N,
-    TOP_N_CAP,
-    CASE2_ENABLED,
-    CASE2_MAX_LEADERS,
-    CASE2_MAX_SECONDARY_ORGS,
-    CASE2_TOTAL_TIMEOUT_SECS,
+    TOP_N_CAP,  # should be 300 now
+    CASE2_ENABLED as CASE2_ENABLED_DEFAULT,
+    CASE2_MAX_LEADERS as CASE2_MAX_LEADERS_DEFAULT,
+    CASE2_TIMEOUT_SECS,
 )
-from backend import scraper, miner, excel_utils
 
-from backend.agent_logic_case2 import enrich_company_record_with_case2
+import backend.scraper as scraper
+import backend.miner as miner
+import backend.excel_utils as excel_utils
+
+# Case-2 modules
+try:
+    import backend.scraper_case2 as scraper_case2
+except Exception:
+    scraper_case2 = None  # type: ignore
 
 
 # -----------------------------
@@ -36,8 +50,7 @@ def _safe_top_n(top_n: Any, default: int, cap: int) -> int:
         n = default
     if n <= 0:
         n = default
-    n = min(n, cap)
-    return max(1, n)
+    return max(1, min(n, cap))
 
 
 def _read_bytes(path: str) -> bytes | None:
@@ -50,159 +63,300 @@ def _read_bytes(path: str) -> bytes | None:
     return None
 
 
-def _env_true(key: str, default: str = "false") -> bool:
-    return os.getenv(key, default).strip().lower() == "true"
-
-
-def _env_int(key: str, default: int) -> int:
-    try:
-        return int(str(os.getenv(key, str(default))).strip())
-    except Exception:
-        return default
-
-
-def _is_yes(v: Any) -> bool:
-    return str(v or "").strip().lower() == "yes"
-
-
-def _norm_url(u: str) -> str:
+def _clean_url(u: str) -> str:
     u = (u or "").strip()
-    if not u:
+    lu = u.lower()
+    if not u or "googleusercontent.com" in lu or "google.com/url" in lu:
+        return ""
+    if u.startswith(("mailto:", "tel:", "javascript:")):
         return ""
     if u.startswith("www."):
-        return "https://" + u
+        u = "https://" + u
+    if not (u.startswith("http://") or u.startswith("https://")):
+        u = "https://" + u
     return u
 
 
 # -----------------------------
-# Pipeline
+# Email helpers
+# -----------------------------
+_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+_FREE_EMAIL_DOMAINS = {
+    "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "live.com",
+    "icloud.com", "aol.com", "proton.me", "protonmail.com", "zoho.com",
+}
+_PREFERRED_PREFIX = (
+    "info@", "contact@", "admin@", "office@", "support@", "help@",
+    "admissions@", "enquiry@", "inquiry@",
+)
+
+
+def _pick_best_email_from_html(html: str) -> str:
+    if not html:
+        return ""
+    emails = [e.lower() for e in _EMAIL_RE.findall(html)]
+    if not emails:
+        return ""
+
+    filtered: List[str] = []
+    for e in emails:
+        try:
+            dom = e.split("@", 1)[1].strip().lower()
+        except Exception:
+            continue
+        if dom in _FREE_EMAIL_DOMAINS:
+            continue
+        filtered.append(e)
+
+    if not filtered:
+        return ""
+
+    for p in _PREFERRED_PREFIX:
+        for e in filtered:
+            if e.startswith(p):
+                return e
+
+    return filtered[0]
+
+
+def _scrape_contact_email_light(website: str, timeout: int) -> str:
+    if not website:
+        return ""
+    try:
+        r = requests.get(
+            website,
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=max(6, int(timeout or 10)),
+            allow_redirects=True,
+        )
+        if r.status_code >= 400:
+            return ""
+        return _pick_best_email_from_html(r.text or "")
+    except Exception:
+        return ""
+
+
+# -----------------------------
+# Case-2 buckets (strict schema)
+# -----------------------------
+BUCKETS = [
+    "Executive Leadership",
+    "Technology / Operations",
+    "Finance / Administration",
+    "Business Development / Growth",
+    "Marketing / Branding",
+]
+
+
+def _empty_case2_management() -> Dict[str, Dict[str, str]]:
+    # keep schema stable for miner/excel
+    return {b: {"name": "", "designation": ""} for b in BUCKETS}
+
+
+def _normalize_case2_management(mgmt: Any) -> Dict[str, Dict[str, str]]:
+    """
+    Ensure mgmt is always in bucketed dict format:
+      {bucket: {"name": "", "designation": ""}}
+    Accepts dict payloads from scraper_case2 and sanitizes them.
+    """
+    out = _empty_case2_management()
+    if not isinstance(mgmt, dict):
+        return out
+
+    for b in BUCKETS:
+        v = mgmt.get(b)
+        if isinstance(v, dict):
+            nm = (v.get("name") or "").strip()
+            dg = (v.get("designation") or v.get("role") or "").strip()
+            if nm and dg:
+                out[b]["name"] = nm
+                out[b]["designation"] = dg
+    return out
+
+
+def _has_leadership_strict(mgmt: Dict[str, Dict[str, str]]) -> bool:
+    d0 = mgmt.get("Executive Leadership") or {}
+    return bool((d0.get("name") or "").strip() and (d0.get("designation") or "").strip())
+
+
+def _apply_case2_management_to_row(
+    row: Dict[str, Any],
+    mgmt: Dict[str, Dict[str, str]],
+    email: str = "",
+) -> None:
+    row["case2_management"] = mgmt
+    row["Leadership Found"] = "Yes" if _has_leadership_strict(mgmt) else "No"
+    if email and not (row.get("Contact Email") or "").strip():
+        row["Contact Email"] = email
+
+
+# -----------------------------
+# SAFE Case-1 scraper wrapper
+# -----------------------------
+def _scrape_case1_safe(
+    query: str,
+    location: str,
+    place: str,
+    run_id: str,
+    max_results: int,
+) -> Tuple[List[Dict[str, Any]], str]:
+
+    # Preferred: scraper.scrape_case1_to_raw supports (place) and expansion (<=300)
+    if hasattr(scraper, "scrape_case1_to_raw"):
+        try:
+            return scraper.scrape_case1_to_raw(
+                query=query,
+                location=location,
+                run_id=run_id,
+                max_results=max_results,
+                place=place,
+            )
+        except TypeError:
+            merged_query = " ".join([x for x in [query, place] if x]).strip()
+            return scraper.scrape_case1_to_raw(
+                query=merged_query,
+                location=location,
+                run_id=run_id,
+                max_results=max_results,
+            )
+
+    # Fallback: single context (still no duplicates guarantee only if upstream returns unique)
+    merged_query = " ".join([x for x in [query, place] if x]).strip()
+    results = scraper.scrape_google_places(
+        query=merged_query,
+        location=location,
+        max_results=max_results,
+    )
+
+    raw_dir = os.path.join("data", "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+    out_path = os.path.join(raw_dir, f"raw_{run_id}.json")
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    return results, out_path
+
+
+# -----------------------------
+# PIPELINE (EXPORT)
 # -----------------------------
 def run_case1_pipeline(
     query: str,
     location: Optional[str] = None,
     place: str = "",
     top_n: int = DEFAULT_TOP_N,
-    use_gpt: bool = False,   # kept for compatibility (unused)
+    use_gpt: bool = False,
     debug: bool = True,
+    case2_enabled: Optional[bool] = None,
+    case2_max_leaders: Optional[int] = None,
 ) -> Dict[str, Any]:
+
+    if case2_enabled is None:
+        case2_enabled = bool(CASE2_ENABLED_DEFAULT)
+
+    if case2_max_leaders is None:
+        try:
+            case2_max_leaders = int(CASE2_MAX_LEADERS_DEFAULT or 5)
+        except Exception:
+            case2_max_leaders = 5
+    case2_max_leaders = max(1, min(int(case2_max_leaders), 5))
+
     location = (location or DEFAULT_LOCATION).strip()
-    place = (place or "").strip()
     query = (query or "").strip()
+    place = (place or "").strip()
 
     if not query:
-        raise ValueError("Query is empty. Please enter what you want to find.")
+        raise ValueError("Query is empty.")
 
-    top_n = _safe_top_n(top_n, default=DEFAULT_TOP_N, cap=TOP_N_CAP)
+    # ✅ now supports up to 300 because TOP_N_CAP updated in config.py
+    top_n = _safe_top_n(top_n, DEFAULT_TOP_N, TOP_N_CAP)
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # 1) SCRAPE (Google Places)
-    raw_records, raw_path = scraper.scrape_case1_to_raw(
+    if debug:
+        print(f"\n🚀 Query={query} | Place={place} | Location={location} | cap={top_n}")
+        print(f"🧠 Case-2 enabled={case2_enabled} max_leaders={case2_max_leaders}")
+
+    # -----------------------------
+    # Case-1: Google Places
+    # -----------------------------
+    raw_records, raw_path = _scrape_case1_safe(
         query=query,
         location=location,
         place=place,
         run_id=ts,
         max_results=top_n,
-        debug=debug,
     )
 
-    # 2) MINE (clean + dedupe)
-    cleaned_rows, stats = miner.mine_case1_records(raw_records=raw_records, gpt_client=None)
+    if debug:
+        print(f"📊 Raw pulled: {len(raw_records)}")
+
+    cleaned_rows, stats = miner.mine_case1_records(raw_records=raw_records)
     cleaned_rows = (cleaned_rows or [])[:top_n]
 
-    # Ensure leader columns always exist (even if Case-2 is OFF / fails)
+    # Ensure baseline keys exist
     for row in cleaned_rows:
-        for i in range(1, 6):
-            row.setdefault(f"Leader {i} Name", "")
-            row.setdefault(f"Leader {i} Designation", "")
+        row.setdefault("Leadership Found", "No")
+        row.setdefault("case2_management", _empty_case2_management())
 
-    # 3) OPTIONAL CASE-2 (Top leaders from website) - SAFE + FAST
-    # runtime overrides (UI sets env vars, so this matters)
-    case2_enabled_runtime = _env_true("CASE2_ENABLED", "true" if CASE2_ENABLED else "false")
-
-    # how many orgs to process in case2
-    case2_org_limit = _env_int("CASE2_MAX_SECONDARY_ORGS", int(CASE2_MAX_SECONDARY_ORGS))
-    case2_org_limit = max(1, min(case2_org_limit, 100))
-
-    # overall time cap (prevents hang)
-    case2_total_cap = _env_int("CASE2_TOTAL_TIMEOUT_SECS", int(CASE2_TOTAL_TIMEOUT_SECS))
-    case2_total_cap = max(20, min(case2_total_cap, 600))
-
-    # leaders cap
-    case2_max_leaders = _env_int("CASE2_MAX_LEADERS", int(CASE2_MAX_LEADERS))
-    case2_max_leaders = max(1, min(case2_max_leaders, 5))
-
-    case2_ran = 0
-    case2_skipped_no_website = 0
-    case2_errors = 0
-    case2_stopped_by_timeout = 0
-
-    if case2_enabled_runtime and cleaned_rows:
+    # -----------------------------
+    # Case-2: Leadership enrichment
+    # -----------------------------
+    if case2_enabled and cleaned_rows:
         start = time.time()
-        limit = min(case2_org_limit, len(cleaned_rows))
+        global_timeout = 600  # 10 min guard
 
-        for i in range(limit):
-            # ✅ overall guard
-            if time.time() - start > case2_total_cap:
-                case2_stopped_by_timeout = 1
+        for i, row in enumerate(cleaned_rows):
+            if time.time() - start > global_timeout:
+                if debug:
+                    print("🛑 Global Timeout reached. Stopping Case-2 enrichment.")
                 break
 
-            row = cleaned_rows[i]
+            website = _clean_url(row.get("Website URL") or "")
+            mgmt = _empty_case2_management()
+            email = ""
 
-            has_web = _is_yes(row.get("Has Website"))
-            website = _norm_url(str(row.get("Website URL") or row.get("Website") or row.get("website") or ""))
+            if website and scraper_case2 is not None and hasattr(scraper_case2, "run_discovery_sync"):
+                try:
+                    payload, email2 = scraper_case2.run_discovery_sync(website, row.get("Company Name", ""))
+                    # payload expected: {"case2_management": {...}}
+                    mgmt = _normalize_case2_management((payload or {}).get("case2_management"))
+                    email = (email2 or "").strip()
+                except Exception:
+                    mgmt = _empty_case2_management()
+                    email = ""
 
-            if (not has_web) or (not website):
-                case2_skipped_no_website += 1
-                continue
+            # Fallback email scrape (homepage only)
+            if website and not email and not (row.get("Contact Email") or "").strip():
+                email = _scrape_contact_email_light(website, int(CASE2_TIMEOUT_SECS or 10))
 
-            try:
-                # ✅ This will add:
-                # - row["case2_leaders"]
-                # - row["case2_meta"]
-                # - Leader 1..5 columns
-                # (max leaders = CASE2_MAX_LEADERS from config/env)
-                os.environ["CASE2_MAX_LEADERS"] = str(case2_max_leaders)
-                enrich_company_record_with_case2(row)
-                case2_ran += 1
-            except Exception as e:
-                # keep pipeline safe (no crash)
-                row["case2_leaders"] = []
-                row["case2_meta"] = {"website": website, "error": str(e)}
-                for k in range(1, 6):
-                    row.setdefault(f"Leader {k} Name", "")
-                    row.setdefault(f"Leader {k} Designation", "")
-                case2_errors += 1
+            _apply_case2_management_to_row(row, mgmt, email)
 
-    # 4) STATS
-    stats = stats or {}
-    stats["top_n"] = top_n
-    stats["returned_rows"] = len(cleaned_rows) if cleaned_rows else 0
-    stats["raw_count"] = int(stats.get("raw_count") or (len(raw_records) if raw_records else 0))
-    stats["clean_count"] = int(stats.get("clean_count") or len(cleaned_rows))
+            if debug:
+                ok = "✅" if row.get("Leadership Found") == "Yes" else "⚠️"
+                print(f"{ok} [{i+1}/{len(cleaned_rows)}] {row.get('Company Name','')}")
 
-    # case2 stats
-    stats["case2_enabled"] = bool(case2_enabled_runtime)
-    stats["case2_max_leaders"] = int(case2_max_leaders)
-    stats["case2_org_limit"] = int(case2_org_limit)
-    stats["case2_total_timeout_secs"] = int(case2_total_cap)
-    stats["case2_ran"] = int(case2_ran)
-    stats["case2_skipped_no_website"] = int(case2_skipped_no_website)
-    stats["case2_errors"] = int(case2_errors)
-    stats["case2_stopped_by_timeout"] = int(case2_stopped_by_timeout)
-
-    # 5) EXCEL
+    # -----------------------------
+    # Export
+    # -----------------------------
     os.makedirs("data/output", exist_ok=True)
     excel_path = os.path.join("data/output", f"case1_{ts}.xlsx")
     excel_utils.write_case1_excel(rows=cleaned_rows, out_path=excel_path)
 
-    excel_bytes = _read_bytes(excel_path)
-    if not excel_bytes:
-        raise RuntimeError("Excel generation failed: output file not found or unreadable.")
+    # ✅ Stats keys: provide BOTH names to avoid UI mismatch bugs
+    with_leadership = sum(1 for r in cleaned_rows if r.get("Leadership Found") == "Yes")
 
     return {
-        "raw_path": raw_path,
         "excel_path": excel_path,
-        "excel_bytes": excel_bytes,
-        "cleaned_rows": cleaned_rows or [],
-        "stats": stats,
+        "excel_bytes": _read_bytes(excel_path),
+        "cleaned_rows": cleaned_rows,
+        "stats": {
+            "clean_count": len(cleaned_rows),
+            "with_leadership": with_leadership,  # backend canonical
+            "with_leaders": with_leadership,     # UI compatibility (your UI used this earlier)
+        },
+        "raw_path": raw_path,
     }
